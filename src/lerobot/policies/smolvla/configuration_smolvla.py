@@ -44,6 +44,9 @@ class SmolVLAConfig(PreTrainedConfig): # SmolVLA 策略配置主体
     max_state_dim: int = 32 # 状态向量的最大维度（用于线性投影）
     max_action_dim: int = 32 # 动作向量的最大维度（用于线性投影）
 
+    arm_dims: list[int] | None = None
+    group_arms: list[int] | None = None
+
     # Image preprocessing # 图像预处理参数
     resize_imgs_with_padding: tuple[int, int] = (512, 512) # 图像短边填充后统一到 512×512
 
@@ -85,7 +88,7 @@ class SmolVLAConfig(PreTrainedConfig): # SmolVLA 策略配置主体
     scheduler_decay_lr: float = 2.5e-6 # 退火后最低学习率
 
     vlm_model_name: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"  # Select the VLM backbone. # 主干 VLM 模型名称
-    load_vlm_weights: bool = False  # Set to True in case of training the expert from scratch. True when init from pretrained SmolVLA weights # 是否加载主干权重
+    load_vlm_weights: bool = True  # Set to True in case of training the expert from scratch. True when init from pretrained SmolVLA weights # 是否加载主干权重
 
     add_image_special_tokens: bool = False  # Whether to use special image tokens around image features. # 是否在图像特征前后添加特殊令牌
 

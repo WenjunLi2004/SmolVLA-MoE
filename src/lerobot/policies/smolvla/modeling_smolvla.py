@@ -56,6 +56,7 @@ import math
 from collections import deque
 from typing import TypedDict
 
+import os
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
@@ -76,6 +77,7 @@ class ActionSelectKwargs(TypedDict, total=False):  # 选择动作时可选的关
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+    group_arms: list[int] | None
 
 
 def create_sinusoidal_pos_embedding(
@@ -369,7 +371,7 @@ class SmolVLAPolicy(PreTrainedPolicy):  # 策略包装类：封装 VLAFlowMatchi
         actions = self.prepare_action(batch)  # 后缀：动作填充到统一维度
         actions_is_pad = batch.get("actions_id_pad")  # 动作是否在序列外（episode 边界）
         loss_dict = {}  # 记录各阶段的损失以便调试
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)  # 经 VLM+Expert 前向得到速度 v_t 并计算 MSE(u_t, v_t)
+        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time, group_arms=self.config.group_arms)  # 经 VLM+Expert 前向得到速度 v_t 并计算 MSE(u_t, v_t)
         loss_dict["losses_after_forward"] = losses.clone()
 
         if actions_is_pad is not None:
@@ -722,8 +724,23 @@ class VLAFlowMatching(nn.Module):
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))  # 扩展到批维
         return embs, pad_masks, att_masks  # 返回后缀嵌入与掩码
 
+    def get_group_mask(self, group_arms: list[int] | None, bsize: int, device: torch.device) -> torch.Tensor:
+        if group_arms is not None and self.config.arm_dims is not None and len(self.config.arm_dims) > 0:
+            mask = torch.zeros(bsize, self.config.chunk_size, self.config.max_action_dim, dtype=torch.float32, device=device)
+            start = 0
+            for i, dim in enumerate(self.config.arm_dims):
+                end = start + dim
+                arm_id = i + 1
+                if arm_id in group_arms:
+                    if end > start:
+                        idxs = torch.arange(start, end, dtype=torch.long, device=device)
+                        mask[:, :, idxs] = 1.0
+                start = end
+            return mask
+        return torch.ones(bsize, self.config.chunk_size, self.config.max_action_dim, dtype=torch.float32, device=device)
+
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None, group_arms: list[int] | None = None
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""  # 流匹配训练：预测 v_t 拟合 u_t
         if noise is None:  # 训练时若未提供噪声，则按动作形状采样
@@ -732,9 +749,30 @@ class VLAFlowMatching(nn.Module):
         if time is None:  # 训练时若未提供时间，则按 Beta 分布采样 t∈(0,1)
             time = self.sample_time(actions.shape[0], actions.device)
 
-        time_expanded = time[:, None, None]  # 扩展时间维以与动作维度对齐
-        x_t = time_expanded * noise + (1 - time_expanded) * actions  # 按时间线性插值噪声与动作（流匹配输入）
-        u_t = noise - actions  # 目标速度（噪声到动作的差值）
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
+        group_arms = group_arms if group_arms is not None else self.config.group_arms
+        group_mask = self.get_group_mask(group_arms, actions.shape[0], actions.device)
+        # TEST
+        if os.getenv("SMOLVLA_DEBUG_MASK", "0") == "1" and not getattr(self, "_mask_debug_train_printed", False):
+            try:
+                enabled = torch.nonzero(group_mask[0, 0], as_tuple=False).squeeze(-1).tolist()
+                start = 0
+                segs = []
+                for i, dim in enumerate(self.config.arm_dims or []):
+                    end = start + dim
+                    seg_enabled = [d for d in enabled if start <= d < end]
+                    segs.append((i + 1, start, end, seg_enabled))
+                    start = end
+                print(f"[SmolVLA][train] group_arms={group_arms} arm_dims={self.config.arm_dims} enabled_dims@t0={enabled} segments={segs}")
+                if os.getenv("SMOLVLA_DEBUG_MASK_PDB", "0") == "1":
+                    import pdb
+                    pdb.set_trace()
+            except Exception:
+                pass
+            setattr(self, "_mask_debug_train_printed", True)
+        x_t = x_t * group_mask
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )  # 生成前缀嵌入与掩码
@@ -756,8 +794,10 @@ class VLAFlowMatching(nn.Module):
         suffix_out = suffix_out[:, -self.config.chunk_size :]  # 仅保留动作序列对应的后缀输出
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
-        v_t = self.action_out_proj(suffix_out)  # 专家输出映射到动作空间得到速度 v_t
-        losses = F.mse_loss(u_t, v_t, reduction="none")  # 流匹配损失按元素计算
+        v_t = self.action_out_proj(suffix_out)
+        v_t = v_t * group_mask
+        losses = F.mse_loss(u_t, v_t, reduction="none")
+        losses = losses * group_mask
         return losses
 
     def sample_actions(
@@ -774,9 +814,10 @@ class VLAFlowMatching(nn.Module):
         bsize = state.shape[0]  # 批大小
         device = state.device  # 当前设备
 
-        if noise is None:  # 如未提供噪声则按动作形状采样标准噪声
+        group_arms = kwargs.get("group_arms", self.config.group_arms)
+        if noise is None:
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)  # 形状：B×chunk×dim
-            noise = self.sample_noise(actions_shape, device)  # 采样噪声
+            noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(  # 仅前缀嵌入用于构建 KV 缓存
             images, img_masks, lang_tokens, lang_masks, state=state
@@ -784,7 +825,7 @@ class VLAFlowMatching(nn.Module):
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)  # 前缀二维注意力掩码
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1  # 前缀位置索引
         # Compute image and language key value cache
-        _, past_key_values = self.vlm_with_expert.forward(  # 仅用前缀填充 KV 缓存，供后续动作专家跨注意使用
+        _, past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -795,7 +836,7 @@ class VLAFlowMatching(nn.Module):
         dt = -1.0 / self.config.num_steps  # 负时间步长（从 1 到 0 回退）
         dt = torch.tensor(dt, dtype=torch.float32, device=device)  # 张量化以便计算
 
-        x_t = noise  # 初始化为纯噪声
+        x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)  # 从 t=1 开始向 0 迭代
 
         while time >= -dt / 2:
@@ -809,6 +850,7 @@ class VLAFlowMatching(nn.Module):
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
                     timestep=current_timestep,
+                    group_arms=group_arms,
                 )
 
             if self._rtc_enabled():  # 流式 RTC 模式
@@ -825,10 +867,11 @@ class VLAFlowMatching(nn.Module):
                     execution_horizon=execution_horizon,
                 )
             else:  # 非 RTC 模式
-                v_t = denoise_step_partial_call(x_t)  # 常规模式：直接计算单步速度
+                v_t = denoise_step_partial_call(x_t)
 
             # Euler step
-            x_t += dt * v_t  # 欧拉步：x_{t+dt} = x_t + dt * v_t
+            group_mask = self.get_group_mask(group_arms, bsize, device)
+            x_t += dt * (v_t * group_mask)
 
             # Record x_t and v_t after Euler step (other params are recorded in rtc_processor.denoise_step)
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
@@ -844,9 +887,14 @@ class VLAFlowMatching(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        group_arms: list[int] | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""  # 单步去噪：仅后缀前向，复用前缀 KV
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)  # 生成后缀嵌入与掩码
+        bsize = prefix_pad_masks.shape[0]
+        device = x_t.device
+        group_mask = self.get_group_mask(group_arms, bsize, device)
+        x_t = x_t * group_mask
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]  # 后缀序列长度
         batch_size = prefix_pad_masks.shape[0]  # 批大小
@@ -870,5 +918,24 @@ class VLAFlowMatching(nn.Module):
         suffix_out = outputs_embeds[1]  # 取专家对应的输出分支
         suffix_out = suffix_out[:, -self.config.chunk_size :]  # 仅保留动作序列的后缀部分
         suffix_out = suffix_out.to(dtype=torch.float32)  # 上采到 float32 以匹配投影头精度
-        v_t = self.action_out_proj(suffix_out)  # 映射到动作空间得到速度 v_t
-        return v_t  # 返回单步速度
+        v_t = self.action_out_proj(suffix_out)
+        v_t = v_t * group_mask
+        # TEST
+        if os.getenv("SMOLVLA_DEBUG_MASK", "0") == "1" and not getattr(self, "_mask_debug_infer_printed", False):
+            try:
+                enabled = torch.nonzero(group_mask[0, 0], as_tuple=False).squeeze(-1).tolist()
+                start = 0
+                segs = []
+                for i, dim in enumerate(self.config.arm_dims or []):
+                    end = start + dim
+                    seg_enabled = [d for d in enabled if start <= d < end]
+                    segs.append((i + 1, start, end, seg_enabled))
+                    start = end
+                print(f"[SmolVLA][infer] group_arms={group_arms} arm_dims={self.config.arm_dims} enabled_dims@t0={enabled} segments={segs}")
+                if os.getenv("SMOLVLA_DEBUG_MASK_PDB", "0") == "1":
+                    import pdb
+                    pdb.set_trace()
+            except Exception:
+                pass
+            setattr(self, "_mask_debug_infer_printed", True)
+        return v_t
