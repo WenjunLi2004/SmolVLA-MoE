@@ -10,11 +10,11 @@ export CUDA_VISIBLE_DEVICES=3
 lerobot-train \
   --policy.type=smolvla \
   --dataset.repo_id=move_can_pot \
-  --batch_size=1 \
-  --steps=100 \
+  --batch_size=64 \
+  --steps=20000 \
   --output_dir=outputs/train/smolvla/move_can_pot \
   --policy.vlm_model_name=/data0/lumina/wenjun/lerobot/SmolVLM2-500M\
-  --job_name=my_smolvla_training \
+  --job_name=smolvla_training_move_can_pot \
   --policy.device=cuda \
   --policy.push_to_hub=false \
   --wandb.enable=false

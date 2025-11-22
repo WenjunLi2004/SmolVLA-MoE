@@ -51,6 +51,7 @@ def apply_rope(x, positions, max_wavelength=10_000):
     return res.to(dtype)
 
 
+# 计算“中间层维度”
 def get_intermediate_size(hidden_dim, ffn_dim_multiplier=4, multiple_of=256):
     hidden_dim = int(2 * hidden_dim / 3)
     hidden_dim = int(ffn_dim_multiplier * hidden_dim)
@@ -89,48 +90,64 @@ class SmolVLMWithExpertModel(nn.Module):
         if num_vlm_layers > 0:
             print(f"Reducing the number of VLM layers to {num_vlm_layers} ...")
             self.get_vlm_model().text_model.layers = self.get_vlm_model().text_model.layers[:num_vlm_layers]
+        # 如果>0，才在这里赋值
         self.num_vlm_layers = len(self.get_vlm_model().text_model.layers)
         self.config = config
         # Smaller lm expert
+        # 动作专家（Action Expert）的配置从 VLM 的文本配置拷贝，保持相同的层类型与算子风格
         lm_expert_config = copy.deepcopy(config.text_config)
+        # 读取原始隐藏维度（来自 VLM 文本配置），作为缩放基准
         hidden_size = lm_expert_config.hidden_size
+        # 通过 expert_width_multiplier 缩小专家的隐藏维度（默认 0.75），降低参数量与算力占用
+        # 这里保持与 VLM 架构兼容，仅在宽度上收缩；注释中的 "hidden_size // 2" 是示例说明
         lm_expert_config.hidden_size = int(hidden_size * expert_width_multiplier)  # hidden_size // 2
+        # 计算前馈层（FFN）的中间维度，遵循 SwiGLU 风格并对齐到 multiple_of（默认 256），提升算子效率
         lm_expert_config.intermediate_size = get_intermediate_size(int(hidden_size * expert_width_multiplier))
+        # 默认专家层数与 VLM 层数一致，保证每层都有对应关系，方便跨注意力对齐
         lm_expert_config.num_hidden_layers = self.num_vlm_layers
+        # 若显式设置了更少的专家层数，则要求 VLM 层数能够被专家层数整除，以便均匀挂载
         if num_expert_layers > 0:
             assert len(self.get_vlm_model().text_model.layers) % num_expert_layers == 0, (
                 f"Number of layers in the VLM {len(self.get_vlm_model().text_model.layers)} are not multiple of num_expert_layers {num_expert_layers}"
             )
             lm_expert_config.num_hidden_layers = num_expert_layers
+        # 根据上述配置实例化一个轻量的语言模型作为动作专家；权重从零初始化
         self.lm_expert = AutoModel.from_config(lm_expert_config)
 
+        # 记录专家层数与自注意力插入周期，用于后续层级映射与分支选择
         self.num_expert_layers = len(self.lm_expert.layers)
         self.self_attn_every_n_layers = self_attn_every_n_layers
+        # 在跨注意力模式下，对专家的 k/v 投影进行重映射，使其输入维度匹配来自 VLM 的 KV 缓存
         if "cross" in attention_mode:
-            # Reshape qkv projections to have the same input dimension as the vlm
+            # 重塑专家的 qkv 线性层：保持 q 维度不变，k/v 的输入维度改为 VLM 的 KV 维度，以完成桥接
             for layer_idx in range(len(self.lm_expert.layers)):
+                # 每隔 N 层强制自注意力（SA）时，跳过该层的 k/v 重映射，保持纯自注意力计算
                 if self.self_attn_every_n_layers > 0 and layer_idx % self.self_attn_every_n_layers == 0:
                     continue
+                # k_proj 的输入来自 VLM 的 KV（num_key_value_heads * head_dim），输出为专家的 KV 维度
                 self.lm_expert.layers[layer_idx].self_attn.k_proj = nn.Linear(
                     config.text_config.num_key_value_heads * config.text_config.head_dim,
                     lm_expert_config.num_key_value_heads * lm_expert_config.head_dim,
                     bias=lm_expert_config.attention_bias,
                 )
+                # v_proj 同理，将 VLM 的 V 映射到专家的 V 维度，保证跨注意力中的维度对齐
                 self.lm_expert.layers[layer_idx].self_attn.v_proj = nn.Linear(
                     config.text_config.num_key_value_heads * config.text_config.head_dim,
                     lm_expert_config.num_key_value_heads * lm_expert_config.head_dim,
                     bias=lm_expert_config.attention_bias,
                 )
-        # Remove unused embed_tokens
+        # 移除未使用的嵌入层（专家不直接处理离散语言 token），避免多余参数与无效梯度
         self.lm_expert.embed_tokens = None
 
         self.num_attention_heads = self.config.text_config.num_attention_heads
         self.num_key_value_heads = self.config.text_config.num_key_value_heads
 
+        # 训练相关开关：冻结视觉编码器、仅训练专家或全模型微调、注意力模式与专家隐藏维记录
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
         self.attention_mode = attention_mode
         self.expert_hidden_size = lm_expert_config.hidden_size
+        # 根据上述开关设置各模块的 requires_grad，确保分布式训练下无“未用参数”问题
         self.set_requires_grad()
 
     def get_vlm_model(self):
