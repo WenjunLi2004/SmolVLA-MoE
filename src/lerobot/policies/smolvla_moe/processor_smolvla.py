@@ -19,7 +19,7 @@ from typing import Any
 import torch
 
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
-from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.smolvla_moe.configuration_smolvla import SmolVLAMoEConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     ComplementaryDataProcessorStep,
@@ -37,7 +37,7 @@ from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PR
 
 
 def make_smolvla_pre_post_processors(
-    config: SmolVLAConfig,
+    config: SmolVLAMoEConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
@@ -69,7 +69,7 @@ def make_smolvla_pre_post_processors(
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
-        SmolVLANewLineProcessor(),
+        SmolVLAMoENewLineProcessor(),
         TokenizerProcessorStep(
             tokenizer_name=config.vlm_model_name,
             padding=config.pad_language_to,
@@ -103,8 +103,8 @@ def make_smolvla_pre_post_processors(
     )
 
 
-@ProcessorStepRegistry.register(name="smolvla_new_line_processor")
-class SmolVLANewLineProcessor(ComplementaryDataProcessorStep):
+@ProcessorStepRegistry.register(name="smolvla_moe_new_line_processor")
+class SmolVLAMoENewLineProcessor(ComplementaryDataProcessorStep):
     """
     A processor step that ensures the 'task' description ends with a newline character.
 

@@ -1,0 +1,10 @@
+# Basic experiment configuration (keep unchanged)
+policy_name: SmolVLA-moe
+task_name: handover_block
+task_config: demo_clean
+ckpt_setting: 20000
+seed: 0
+instruction_type: unseen
+policy_path: "/data0/lumina/wenjun/SmolVLA-MoE/outputs/train/smolvla/handover_block_both_finetune2/checkpoints/020000/pretrained_model"
+device: "cuda"
+# Add Parameters You Need

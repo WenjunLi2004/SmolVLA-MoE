@@ -24,9 +24,9 @@ from lerobot.policies.rtc.configuration_rtc import RTCConfig # 引入 RTC（实�
 from lerobot.utils.constants import OBS_IMAGES # 引入观测图像常量键名
 
 
-@PreTrainedConfig.register_subclass("smolvla") # 注册本配置为 "smolvla" 子类，便于选择
+@PreTrainedConfig.register_subclass("smolvla_moe") # 注册本配置为 "smolvla_moe" 子类，便于选择
 @dataclass # 使用数据类简化字段定义与默认值
-class SmolVLAConfig(PreTrainedConfig): # SmolVLA 策略配置主体
+class SmolVLAMoEConfig(PreTrainedConfig): # SmolVLA 策略配置主体
     # Input / output structure. # 输入/输出结构设置
     n_obs_steps: int = 1 # 每次前向使用的历史观测步数（通常为 1）
     chunk_size: int = 50 # 单次模型调用可生成的动作序列长度上限

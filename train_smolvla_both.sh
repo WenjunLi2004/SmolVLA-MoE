@@ -15,7 +15,7 @@ lerobot-train \
   --dataset.repo_id=handover_block \
   --batch_size=64 \
   --steps=20000 \
-  --output_dir=outputs/train/smolvla/handover_block_both \
+  --output_dir=outputs/train/smolvla/handover_block_both_test \
   --policy.vlm_model_name=/data0/lumina/wenjun/SmolVLA-MoE/SmolVLM2-500M\
   --job_name=smolvla_training_handover_block \
   --policy.device=cuda \

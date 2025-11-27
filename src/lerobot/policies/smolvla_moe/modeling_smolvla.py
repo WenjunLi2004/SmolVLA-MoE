@@ -61,11 +61,12 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 from typing_extensions import Unpack
+from safetensors.torch import load_file
 
 from lerobot.policies.pretrained import PreTrainedPolicy  # 预训练策略基类
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor  # 实时分块处理器
-from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig  # SmolVLA 配置
-from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel  # 引入带动作专家（Action Expert）的 VLM 封装
+from lerobot.policies.smolvla_moe.configuration_smolvla import SmolVLAMoEConfig  # SmolVLA 配置
+from lerobot.policies.smolvla_moe.smolvlm_with_expert import SmolVLMMoEWithExpertModel  # 引入带动作专家（Action Expert）的 VLM 封装
 from lerobot.policies.utils import (
     populate_queues,  # 将批次数据入队以便按窗口提取
 )
@@ -225,15 +226,15 @@ def aloha_gripper_from_angular_inv(value):  # 反转 gripper_from_angular 映射
     return normalize(value, min_val=0.4, max_val=1.5)  # 归一化到角度区间
 
 
-class SmolVLAPolicy(PreTrainedPolicy):  # 策略包装类：封装 VLAFlowMatching 用于训练与推理
+class SmolVLAMoEPolicy(PreTrainedPolicy):  # 策略包装类：封装 VLAFlowMatching 用于训练与推理
     """Wrapper class around VLAFlowMatching model to train and run inference within LeRobot."""
 
-    config_class = SmolVLAConfig
-    name = "smolvla"
+    config_class = SmolVLAMoEConfig
+    name = "smolvla_moe"
 
     def __init__(
         self,
-        config: SmolVLAConfig,
+        config: SmolVLAMoEConfig,
     ):
         """
         Args:
@@ -492,6 +493,114 @@ def pad_tensor(tensor, max_len, pad_value=0):
 
     return padded_tensor  # 返回对齐后的张量
 
+# FIXME：Adapter融合
+class ActionFusionAdapter(nn.Module):
+    def __init__(
+        self,
+        max_action_dim: int, # 整个动作向量的总维度，比如两只手臂各 7 维 -> 14
+        num_experts: int,    # expert 数量，比如 3（both / left / right）
+        num_arms: int,       # 机械臂数量，比如 2（左臂 + 右臂）
+        hidden_dim: int,     # Adapter 里 MLP 的中间隐藏维度
+    ):
+        super().__init__()
+        self.max_action_dim = max_action_dim
+        self.num_experts = num_experts
+        self.num_arms = num_arms
+        # TODO: 确定max_action_dim是否是14维,这里以后可以按 group_arms切分
+        self.arm_dim = max_action_dim // num_arms
+
+        # 对于每一个 arm，我们要让一个 MLP 看“所有 experts 对这一只 arm 的输出 + 对应 gate”
+        # 具体来说：
+        #   对于某一只 arm，在一个 token (b,t) 上：
+        #     - 第 0 个 expert 给这一只 arm 一个 arm_dim 维的动作向量 + 1 个 gate 标量 => (arm_dim + 1) 维
+        #     - 第 1 个 expert 也是 (arm_dim + 1) 维
+        #     - ...
+        #     - 第 E-1 个 expert 也是 (arm_dim + 1) 维
+        #   所以所有 expert 拼在一起就是 num_experts * (arm_dim + 1) 维
+        in_dim = num_experts * (self.arm_dim + 1)
+       
+        # 为每一只 arm 单独准备一个 MLP，
+        # 输入维度是 in_dim（来自所有 expert 的“该 arm 动作 + gate”拼接）
+        # 输出维度是 num_experts（为这一只 arm 输出每个 expert 的融合权重 logits）
+        # TODO:目前是每个arm会输出所有Expert的权重，涉及无关的Expert，检查是否输出为0
+        self.arm_mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(in_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, num_experts),
+            )
+            for _ in range(num_arms)
+        ])
+
+    def forward(
+        self,
+        expert_outputs: torch.Tensor,  # [B, T, E, A] 所有 expert 的动作输出
+                                       # B: batch_size, T: 序列长度, E: expert 数, A: 总动作维度
+        gates: torch.Tensor,           # [B, T, E] router 输出的每个 expert 的 gate 分数
+        active_mask: torch.Tensor,     # [B, T, E] 表示每个 (B,T,E) 是否被激活的 bool mask
+    ) -> torch.Tensor:
+        B, T, E, A = expert_outputs.shape
+        arm_dim = self.arm_dim
+        # 初始化融合后的动作张量，形状和单个 expert 的动作向量一致：[B, T, A]
+        # 后面会逐个 arm 写进对应片段
+        fused = torch.zeros(
+            B, T, A, 
+            dtype=expert_outputs.dtype, 
+            device=expert_outputs.device
+        )
+        has_active = active_mask.any(dim=-1, keepdim=True)  # 表示这一行是不是至少有一个激活 expert
+        with torch.no_grad():
+            _all_off = (~active_mask).all(dim=-1)
+            if _all_off.any():
+                _idxs = torch.nonzero(_all_off)[:5]
+                for _i in _idxs:
+                    _b, _t = int(_i[0]), int(_i[1])
+                    print(
+                        f"[MoE] Adapter检测到所有Expert未激活 b={_b} t={_t} gates={gates[_b, _t].detach().cpu().tolist()}"
+                    )
+        # 对每一只机械臂单独做一次融合
+        for arm_idx in range(self.num_arms):
+            #   arm_idx=0 -> [0:7]  代表左臂
+            #   arm_idx=1 -> [7:14] 代表右臂
+            start = arm_idx * arm_dim
+            end = start + arm_dim
+            # TODO: check 无关Expert输出是否被mask掉
+            # FIXME：这里mask是否进行了两次,Expert输出mask和这里的mask
+            arm_expert = expert_outputs[..., start:end]
+
+            # 把对应的 gate 加一个 channel 维度，方便和 arm_expert 拼接：
+            # gates: [B, T, E] -> [B, T, E, 1]
+            gate_chan = gates.unsqueeze(-1)
+            # Expert输出和分数沿着最后一维拼接：
+            # arm_expert: [B, T, E, arm_dim]
+            # gate_chan:  [B, T, E, 1]
+            # arm_feat:   [B, T, E, arm_dim + 1]
+            # 对于某个 (b,t,e)，arm_feat[b,t,e,:] = [该 expert 的 arm 动作（arm_dim维）, gate标量]
+            arm_feat = torch.cat([arm_expert, gate_chan], dim=-1)
+            # 把每个 (b,t) 下所有 expert 的特征展平成一个长向量
+            arm_feat_flat = arm_feat.reshape(B, T, E * (arm_dim + 1))
+            # 向量送进当前 arm 对应的 MLP：输出 [B, T, num_experts]
+            # 对于当前这只 arm，Adapter 认为第 e 个 expert 应该有多大的“权重倾向”
+            logits = self.arm_mlps[arm_idx](arm_feat_flat)
+
+            # 使用 active_mask 把“未激活”的 expert 屏蔽掉：
+            # active_mask: [B, T, E]，True 表示这个 expert 在这个 token 上是激活的
+            # ~active_mask: 未激活的位置为 True
+            # masked_fill(~active_mask, -inf)：强行把未激活专家的 logit 变为 -inf，
+            # 这样 softmax 后这些位置的权重就是 0，不会参与融合。
+            logits = logits.masked_fill(~active_mask & has_active, float('-inf'))
+            # 对 expert 维度做 softmax，得到每个 expert 的权重：
+            # weights: [B, T, E]，并且 sum_e weights[b,t,e] = 1（只在激活 experts 上）
+            weights = torch.softmax(logits, dim=-1)
+            # 对 has_active=False 的 token，直接把权重全置 0，避免 NaN
+            weights = torch.where(has_active, weights, torch.zeros_like(weights))
+            # 用这些权重对当前 arm 的多 expert 输出做加权求和：
+            fused_arm = (weights.unsqueeze(-1) * arm_expert).sum(dim=2)
+            # 把这只 arm 的融合动作写回 fused 对应的片段：
+            # fused: [B, T, A]，其中 [start:end] 对应当前 arm
+            fused[..., start:end] = fused_arm
+        return fused
+
 # SmolVLA 流匹配主模型：组合 VLM 与动作专家，执行条件动作解码
 class VLAFlowMatching(nn.Module):  
     """
@@ -519,12 +628,12 @@ class VLAFlowMatching(nn.Module):
     └──────────────────────────────┘
     """
 
-    def __init__(self, config: SmolVLAConfig, rtc_processor: RTCProcessor | None = None):  # 初始化：实例化带专家的 VLM 与各投影层
+    def __init__(self, config: SmolVLAMoEConfig, rtc_processor: RTCProcessor | None = None):  # 初始化：实例化带专家的 VLM 与各投影层
         super().__init__()
         self.config = config
         
         # 动作专家（Action Expert）通过该封装与 VLM 交互
-        self.vlm_with_expert = SmolVLMWithExpertModel(  
+        self.vlm_with_expert = SmolVLMMoEWithExpertModel(  
             model_id=self.config.vlm_model_name,
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
@@ -541,9 +650,76 @@ class VLAFlowMatching(nn.Module):
         self.action_in_proj = nn.Linear(
             self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size
         )  # 将动作映射到专家隐藏维度，用作后缀输入
-        self.action_out_proj = nn.Linear(
+        # FIXME: 所有Expert -- action_out_proj 
+        self.action_out_proj_both = nn.Linear(
             self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim
         )  # 将专家输出映射回动作空间（预测速度 v_t）
+        self.action_out_proj_left = nn.Linear(
+            self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim
+        )
+        self.action_out_proj_right = nn.Linear(
+            self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim
+        )
+        
+        # ADD：先硬编码为3，后面调整为Expert_num FIXME
+        self.router_head = nn.Linear(self.vlm_with_expert.expert_hidden_size, 3)
+        self.router_threshold = 0.5
+        # ADD：Adapter构建
+        self.adapter = ActionFusionAdapter(
+            max_action_dim=14,# 这里不能使用max_action_dim，默认32维，计算可以，但是具体划分还是要按照14维
+            num_experts=3,
+            num_arms=2,
+            hidden_dim=self.vlm_with_expert.expert_hidden_size // 2,
+        )
+        
+        # FIXME:读取预训练权重
+        _both_path = "/data0/lumina/wenjun/SmolVLA-MoE/outputs/train/smolvla/handover_block_both/checkpoints/020000/pretrained_model/model.safetensors"
+        _left_path = "/data0/lumina/wenjun/SmolVLA-MoE/outputs/train/smolvla/handover_block_left_arm/checkpoints/020000/pretrained_model/model.safetensors"
+        _right_path = "/data0/lumina/wenjun/SmolVLA-MoE/outputs/train/smolvla/handover_block_right_arm/checkpoints/020000/pretrained_model/model.safetensors"
+
+        # FIXME: 线性层权重载入工具
+        def _load_linear(lin, path):
+            sd = load_file(path)
+            lin.weight.data.copy_(sd["model.action_out_proj.weight"]) 
+            lin.bias.data.copy_(sd["model.action_out_proj.bias"])
+            print(f"Loaded {lin.__class__.__name__} weights from {path}")
+            # 权重冻结
+            for p in lin.parameters():
+                p.requires_grad = False
+
+        _load_linear(self.action_out_proj_both, _both_path)
+        _load_linear(self.action_out_proj_left, _left_path)
+        _load_linear(self.action_out_proj_right, _right_path)
+        
+        # 掩码构建:FIXME 构建方式不够灵活
+        _af = getattr(self.config, "action_feature", None)
+        if _af is not None:
+            _orig_dim = int(_af.shape[0])
+        else:
+            try:
+                _orig_dim = int(self.config.output_features[ACTION].shape[0])
+            except Exception:
+                _orig_dim = int(self.config.max_action_dim)
+        _arm_dims = self.config.arm_dims or [
+            _orig_dim // 2,
+            _orig_dim - (_orig_dim // 2),
+        ]
+        _mask_both = torch.zeros(self.config.max_action_dim, dtype=torch.float32)
+        _mask_both[: _orig_dim] = 1.0
+        _mask_left = torch.zeros(self.config.max_action_dim, dtype=torch.float32)
+        _mask_left[: _arm_dims[0]] = 1.0
+        _mask_right = torch.zeros(self.config.max_action_dim, dtype=torch.float32)
+        _start_r = _arm_dims[0]
+        _mask_right[_start_r : _start_r + _arm_dims[1]] = 1.0
+        self.register_buffer("moe_mask_both", _mask_both)
+        self.register_buffer("moe_mask_left", _mask_left)
+        self.register_buffer("moe_mask_right", _mask_right)
+        print(f"moe_mask_both: {self.moe_mask_both}")
+        print(f"moe_mask_left: {self.moe_mask_left}")
+        print(f"moe_mask_right: {self.moe_mask_right}")
+        # FIXME:Router反向传播
+        for p in self.router_head.parameters():
+            p.requires_grad = True
 
         self.action_time_mlp_in = nn.Linear(
             self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
@@ -570,6 +746,12 @@ class VLAFlowMatching(nn.Module):
     def set_requires_grad(self):  # 设置各投影层是否参与训练（按配置开关）
         for params in self.state_proj.parameters():
             params.requires_grad = self.config.train_state_proj  # 控制 state_proj 是否训练；其余由上层封装控制
+    
+    # FIXME:定义Router
+    def router(self, suffix_out: torch.Tensor) -> torch.Tensor:
+        logits = self.router_head(suffix_out)
+        gates = torch.sigmoid(logits)
+        return gates
 
     def sample_noise(self, shape, device):  # 采样标准高斯噪声，用作流匹配输入或初始状态
         noise = torch.normal(
@@ -724,20 +906,6 @@ class VLAFlowMatching(nn.Module):
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))  # 扩展到批维
         return embs, pad_masks, att_masks  # 返回后缀嵌入与掩码
 
-    def get_group_mask(self, group_arms: list[int] | None, bsize: int, device: torch.device) -> torch.Tensor:
-        if group_arms is not None and self.config.arm_dims is not None and len(self.config.arm_dims) > 0:
-            mask = torch.zeros(bsize, self.config.chunk_size, self.config.max_action_dim, dtype=torch.float32, device=device)
-            start = 0
-            for i, dim in enumerate(self.config.arm_dims):
-                end = start + dim
-                arm_id = i + 1
-                if arm_id in group_arms:
-                    if end > start:
-                        idxs = torch.arange(start, end, dtype=torch.long, device=device)
-                        mask[:, :, idxs] = 1.0
-                start = end
-            return mask
-        return torch.ones(bsize, self.config.chunk_size, self.config.max_action_dim, dtype=torch.float32, device=device)
 
     def forward(
         self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None, group_arms: list[int] | None = None
@@ -753,26 +921,6 @@ class VLAFlowMatching(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
         group_arms = group_arms if group_arms is not None else self.config.group_arms
-        group_mask = self.get_group_mask(group_arms, actions.shape[0], actions.device)
-        # TEST
-        if os.getenv("SMOLVLA_DEBUG_MASK", "0") == "1" and not getattr(self, "_mask_debug_train_printed", False):
-            try:
-                enabled = torch.nonzero(group_mask[0, 0], as_tuple=False).squeeze(-1).tolist()
-                start = 0
-                segs = []
-                for i, dim in enumerate(self.config.arm_dims or []):
-                    end = start + dim
-                    seg_enabled = [d for d in enabled if start <= d < end]
-                    segs.append((i + 1, start, end, seg_enabled))
-                    start = end
-                print(f"[SmolVLA][train] group_arms={group_arms} arm_dims={self.config.arm_dims} enabled_dims@t0={enabled} segments={segs}")
-                if os.getenv("SMOLVLA_DEBUG_MASK_PDB", "0") == "1":
-                    import pdb
-                    pdb.set_trace()
-            except Exception:
-                pass
-            setattr(self, "_mask_debug_train_printed", True)
-        x_t = x_t * group_mask
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )  # 生成前缀嵌入与掩码
@@ -794,10 +942,15 @@ class VLAFlowMatching(nn.Module):
         suffix_out = suffix_out[:, -self.config.chunk_size :]  # 仅保留动作序列对应的后缀输出
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
-        v_t = self.action_out_proj(suffix_out)
-        v_t = v_t * group_mask
+        # FIXME：整个MoE流程
+        # 1. Router根据suffix_out计算gates
+        gates = self.router(suffix_out)
+        # 2. 根据gates计算专家输出和激活掩码
+        expert_outputs, active_mask = self.compute_expert_outputs(suffix_out, gates)
+        # 3. Adapter融合专家输出
+        v_t = self.adapter(expert_outputs, gates, active_mask)
+        # 4. 计算损失
         losses = F.mse_loss(u_t, v_t, reduction="none")
-        losses = losses * group_mask
         return losses
 
     def sample_actions(
@@ -870,8 +1023,7 @@ class VLAFlowMatching(nn.Module):
                 v_t = denoise_step_partial_call(x_t)
 
             # Euler step
-            group_mask = self.get_group_mask(group_arms, bsize, device)
-            x_t += dt * (v_t * group_mask)
+            x_t += dt * v_t 
 
             # Record x_t and v_t after Euler step (other params are recorded in rtc_processor.denoise_step)
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
@@ -892,8 +1044,7 @@ class VLAFlowMatching(nn.Module):
         """Apply one denoising step of the noise `x_t` at a given timestep."""  # 单步去噪：仅后缀前向，复用前缀 KV
         bsize = prefix_pad_masks.shape[0]
         device = x_t.device
-        group_mask = self.get_group_mask(group_arms, bsize, device)
-        x_t = x_t * group_mask
+        x_t = x_t
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]  # 后缀序列长度
@@ -918,24 +1069,71 @@ class VLAFlowMatching(nn.Module):
         suffix_out = outputs_embeds[1]  # 取专家对应的输出分支
         suffix_out = suffix_out[:, -self.config.chunk_size :]  # 仅保留动作序列的后缀部分
         suffix_out = suffix_out.to(dtype=torch.float32)  # 上采到 float32 以匹配投影头精度
-        v_t = self.action_out_proj(suffix_out)
-        v_t = v_t * group_mask
-        # TEST
-        if os.getenv("SMOLVLA_DEBUG_MASK", "0") == "1" and not getattr(self, "_mask_debug_infer_printed", False):
-            try:
-                enabled = torch.nonzero(group_mask[0, 0], as_tuple=False).squeeze(-1).tolist()
-                start = 0
-                segs = []
-                for i, dim in enumerate(self.config.arm_dims or []):
-                    end = start + dim
-                    seg_enabled = [d for d in enabled if start <= d < end]
-                    segs.append((i + 1, start, end, seg_enabled))
-                    start = end
-                print(f"[SmolVLA][infer] group_arms={group_arms} arm_dims={self.config.arm_dims} enabled_dims@t0={enabled} segments={segs}")
-                if os.getenv("SMOLVLA_DEBUG_MASK_PDB", "0") == "1":
-                    import pdb
-                    pdb.set_trace()
-            except Exception:
-                pass
-            setattr(self, "_mask_debug_infer_printed", True)
+        # FIXME
+        gates = self.router(suffix_out)
+        expert_outputs, active_mask = self.compute_expert_outputs(suffix_out, gates)
+        v_t = self.adapter(expert_outputs, gates, active_mask)
         return v_t
+
+    # FIXME:根据gates判断专家激活和输出，并输出对应的mask
+    # TODO:确认逻辑是否正确
+    def compute_expert_outputs(
+        self,
+        suffix_out: torch.Tensor,
+        gates: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute per-expert masked outputs with conditional evaluation.
+
+        Args:
+            suffix_out: Tensor of shape [B, T, H] where H is expert hidden size.
+            gates: Tensor of shape [B, T, E] where E=num_experts (3: both/left/right),
+                   values in (0,1) from sigmoid.
+
+        Returns:
+            expert_outputs: Tensor of shape [B, T, E, A], where A=max_action_dim.
+            active_mask:    Bool tensor of shape [B, T, E]. True indicates expert is active.
+        """
+        B, T, H = suffix_out.shape
+        E = gates.shape[-1]
+        # 这里是32维，但实际只有前14维
+        A = self.config.max_action_dim
+        active_mask = torch.stack(
+            [gates[..., 0] > self.router_threshold, 
+            gates[..., 1] > self.router_threshold, 
+            gates[..., 2] > self.router_threshold],
+            dim=-1,
+        ) # [B, T, 3] bool
+
+        with torch.no_grad():
+            _B, _T, _E = active_mask.shape
+            _total = int(_B * _T)
+            _all_off = (~active_mask).all(dim=-1)
+            _num_all_off = int(_all_off.sum().item())
+            _gate_mean = gates.mean(dim=(0, 1)).detach().cpu().tolist()
+            _active_counts = active_mask.sum(dim=(0, 1)).detach().cpu().tolist()
+            print(
+                f"[MoE] B={_B} T={_T} E={_E} gate均值={_gate_mean} 激活数={_active_counts} all_off={_num_all_off}/{_total}"
+            )
+            if _num_all_off > 0:
+                _idxs = torch.nonzero(_all_off)[:5]
+                for _i in _idxs:
+                    _b, _t = int(_i[0]), int(_i[1])
+                    _g = gates[_b, _t].detach().cpu().tolist()
+                    _a = active_mask[_b, _t].detach().cpu().tolist()
+                    print(f"[MoE] 全未激活样本 b={_b} t={_t} gates={_g} active={_a}")
+
+        outputs = torch.zeros(B, T, E, A, dtype=suffix_out.dtype, device=suffix_out.device)
+
+        def _eval_and_scatter(active_bt: torch.Tensor, linear: nn.Linear, mask: torch.Tensor, eidx: int):
+            if active_bt.any():
+                flat = active_bt.view(-1)
+                sel = suffix_out.view(-1, H)[flat]
+                v_sel = linear(sel) * mask.view(1, -1)
+                outputs.view(-1, E, A)[flat, eidx] = v_sel
+
+        _eval_and_scatter(active_mask[..., 0], self.action_out_proj_both, self.moe_mask_both, 0)
+        _eval_and_scatter(active_mask[..., 1], self.action_out_proj_left, self.moe_mask_left, 1)
+        _eval_and_scatter(active_mask[..., 2], self.action_out_proj_right, self.moe_mask_right, 2)
+
+        return outputs, active_mask
