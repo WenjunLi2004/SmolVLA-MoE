@@ -249,6 +249,9 @@ class SmolVLAMoEPolicy(PreTrainedPolicy):  # 策略包装类：封装 VLAFlowMat
         self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)  # 主模型组合：VLM + Action Expert
         self.reset()
 
+        # 添加 current_step 用于动态调整 router_loss_weight
+        self.current_step = 0
+
     def reset(self):
         """This should be called whenever the environment is reset."""
         self._queues = {
@@ -549,15 +552,6 @@ class ActionFusionAdapter(nn.Module):
             device=expert_outputs.device
         )
         has_active = active_mask.any(dim=-1, keepdim=True)  # 表示这一行是不是至少有一个激活 expert
-        with torch.no_grad():
-            _all_off = (~active_mask).all(dim=-1)
-            if _all_off.any():
-                _idxs = torch.nonzero(_all_off)[:5]
-                for _i in _idxs:
-                    _b, _t = int(_i[0]), int(_i[1])
-                    print(
-                        f"[MoE] Adapter检测到所有Expert未激活 b={_b} t={_t} gates={gates[_b, _t].detach().cpu().tolist()}"
-                    )
         # 对每一只机械臂单独做一次融合
         for arm_idx in range(self.num_arms):
             #   arm_idx=0 -> [0:7]  代表左臂
@@ -673,9 +667,9 @@ class VLAFlowMatching(nn.Module):
         )
         
         # FIXME:读取预训练权重
-        _both_path = "/data0/lumina/wenjun/SmolVLA-MoE/outputs/train/smolvla/handover_block_both/checkpoints/020000/pretrained_model/model.safetensors"
-        _left_path = "/data0/lumina/wenjun/SmolVLA-MoE/outputs/train/smolvla/handover_block_left_arm/checkpoints/020000/pretrained_model/model.safetensors"
-        _right_path = "/data0/lumina/wenjun/SmolVLA-MoE/outputs/train/smolvla/handover_block_right_arm/checkpoints/020000/pretrained_model/model.safetensors"
+        _both_path = "/data0/lumina/wenjun/SmolVLA-MoE/outputs/train/smolvla/adjust_bottle_both/checkpoints/last/pretrained_model/model.safetensors"
+        _left_path = "/data0/lumina/wenjun/SmolVLA-MoE/outputs/train/smolvla/adjust_bottle_left_arm/checkpoints/last/pretrained_model/model.safetensors"
+        _right_path = "/data0/lumina/wenjun/SmolVLA-MoE/outputs/train/smolvla/adjust_bottle_right_arm/checkpoints/last/pretrained_model/model.safetensors"
 
         # FIXME: 线性层权重载入工具
         def _load_linear(lin, path):
@@ -1043,8 +1037,6 @@ class VLAFlowMatching(nn.Module):
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""  # 单步去噪：仅后缀前向，复用前缀 KV
         bsize = prefix_pad_masks.shape[0]
-        device = x_t.device
-        x_t = x_t
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]  # 后缀序列长度
