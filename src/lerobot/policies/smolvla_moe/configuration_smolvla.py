@@ -46,7 +46,8 @@ class SmolVLAMoEConfig(PreTrainedConfig): # SmolVLA 策略配置主体
 
     arm_dims: list[int] | None = None # 定义每个机械臂的维度 e.g. 双臂 [7,7]
     group_arms: list[int] | None = None # 使用哪个机械臂 e.g. 左臂[1] 右臂[2] 双臂[1,2]
-
+    num_experts: int = 3 # 专家数量（默认 3）
+    moe_top_k: int = 2 # 可以在 config 里调，默认 top-2
     # Image preprocessing # 图像预处理参数
     resize_imgs_with_padding: tuple[int, int] = (512, 512) # 图像短边填充后统一到 512×512
 
