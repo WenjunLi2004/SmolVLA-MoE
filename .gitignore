@@ -166,6 +166,7 @@ wandb/
 # Data folders
 data/
 outputs/
+scripts/
 SmolVLM2-500M/
 # Translations
 *.mo

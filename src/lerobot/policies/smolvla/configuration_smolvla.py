@@ -41,8 +41,8 @@ class SmolVLAConfig(PreTrainedConfig): # SmolVLA 策略配置主体
     ) # 各模态归一化策略映射
 
     # Shorter state and action vectors will be padded # 维度不足时填充到统一长度
-    max_state_dim: int = 32 # 状态向量的最大维度（用于线性投影）
-    max_action_dim: int = 32 # 动作向量的最大维度（用于线性投影）
+    max_state_dim: int = 14 # 状态向量的最大维度（用于线性投影）
+    max_action_dim: int = 14 # 动作向量的最大维度（用于线性投影）
 
     arm_dims: list[int] | None = None
     group_arms: list[int] | None = None

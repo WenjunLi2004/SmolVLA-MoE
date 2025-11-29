@@ -326,7 +326,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if is_main_process:
         logging.info("Start offline training on a fixed dataset")
 
-    for _ in range(step, cfg.steps):
+    # Initialize tqdm progress bar
+    from tqdm import tqdm
+    pbar = tqdm(range(step, cfg.steps), desc="Training", dynamic_ncols=True, disable=not is_main_process)
+
+    for _ in pbar:
         start_time = time.perf_counter()
         batch = next(dl_iter)
         batch = preprocessor(batch)
